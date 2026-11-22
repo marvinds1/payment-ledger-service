@@ -23,14 +23,17 @@ export const options = {
 };
 
 const json = { 'Content-Type': 'application/json' };
+const CLIENTS = Number(__ENV.CLIENTS || 50);
+// Spread traffic over several API clients so the per-client rate limit is exercised realistically.
+const client = () => ({ 'X-Client-Id': `k6-client-${Math.floor(Math.random() * CLIENTS)}` });
 
 export function setup() {
   const ids = [];
   for (let i = 0; i < ACCOUNTS; i++) {
     const account = http.post(`${BASE_URL}/api/v1/accounts`,
-      JSON.stringify({ ownerName: `load-${i}`, currency: 'IDR' }), { headers: json }).json();
+      JSON.stringify({ ownerName: `load-${i}`, currency: 'IDR' }), { headers: { ...json, ...client() } }).json();
     http.post(`${BASE_URL}/api/v1/accounts/${account.id}/deposits`,
-      JSON.stringify({ amount: 1000000000 }), { headers: { ...json, 'Idempotency-Key': uuidv4() } });
+      JSON.stringify({ amount: 1000000000 }), { headers: { ...json, ...client(), 'Idempotency-Key': uuidv4() } });
     ids.push(account.id);
   }
   return { ids };
@@ -44,6 +47,6 @@ export default function ({ ids }) {
   }
   const res = http.post(`${BASE_URL}/api/v1/transfers`,
     JSON.stringify({ sourceAccountId: source, targetAccountId: target, amount: 1000, currency: 'IDR' }),
-    { headers: { ...json, 'Idempotency-Key': uuidv4() } });
+    { headers: { ...json, ...client(), 'Idempotency-Key': uuidv4() } });
   check(res, { 'transfer created': (r) => r.status === 201 });
 }

@@ -20,6 +20,7 @@ published as an event.**
 | Auditability | Rejected transfers (e.g. insufficient funds) are persisted too, so a retry gets the same answer and there is a full trail. |
 | Schema | Versioned migrations with Flyway. Money is stored as `BIGINT` minor units, never floating point. |
 | Observability | Micrometer metrics exposed for Prometheus: transfer outcomes and latency, money moved, outbox backlog and publish failures. A provisioned Grafana dashboard ships with the repo. |
+| Abuse protection | Per-client rate limiting on write endpoints with a Redis token bucket (atomic Lua script). Over the limit → `429` with `Retry-After`. Fails open if Redis is down, so the limiter can never take payments offline. |
 
 ## Architecture
 
@@ -77,7 +78,7 @@ curl -s -X POST localhost:8080/api/v1/transfers \
 Requirements: Java 17, Maven, Docker.
 
 ```bash
-docker compose up -d postgres kafka     # infrastructure only
+docker compose up -d postgres kafka redis   # infrastructure only
 mvn spring-boot:run                     # app on :8080
 
 # or everything in containers
@@ -90,7 +91,7 @@ docker compose --profile app up --build
 mvn verify
 ```
 
-Integration tests run against real PostgreSQL and Kafka via Testcontainers and cover:
+Integration tests run against real PostgreSQL, Kafka and Redis via Testcontainers and cover:
 
 - happy-path transfer with balanced ledger entries
 - idempotent replay, and key reuse with a different payload
@@ -100,6 +101,8 @@ Integration tests run against real PostgreSQL and Kafka via Testcontainers and c
 - 10 concurrent requests with the same key → exactly one transfer
 - global invariants: sum of balances is zero, every balance matches its entries
 - outbox event delivered to the Kafka topic
+- rate limiting: `429` + `Retry-After` beyond capacity, separate buckets per client, reads not limited,
+  remote-address fallback, token refill over time, and fail-open when Redis is unreachable
 
 ## Load test
 
@@ -114,7 +117,7 @@ docker run --rm -i --network host -e BASE_URL=http://localhost:8080 grafana/k6 r
 Metrics are exposed at `/actuator/prometheus`. A local Prometheus + Grafana stack is included:
 
 ```bash
-docker compose up -d postgres kafka
+docker compose up -d postgres kafka redis
 docker compose --profile observability up -d   # Prometheus :9090, Grafana :3000
 mvn spring-boot:run
 ```
@@ -132,6 +135,7 @@ works whether the app runs on the host or with `--profile app`.
 | `ledger_outbox_oldest_pending_age_seconds` | gauge | – | How far event delivery is lagging behind; `0` when nothing is pending |
 | `ledger_outbox_published_events_total` | counter | – | Events relayed to Kafka |
 | `ledger_outbox_publish_failures_total` | counter | – | Failed relay batches (they are retried on the next poll) |
+| `ledger_ratelimit_decisions_total` | counter | `result` (allowed, limited, unavailable) | Rate limiter outcomes; `unavailable` means Redis was unreachable and the request was let through |
 
 Standard Spring Boot metrics (`http_server_requests_seconds`, HikariCP, JVM) are exported too.
 
@@ -144,6 +148,34 @@ Notes:
   Prometheus cardinality low.
 - Suggested alerts: `ledger_outbox_oldest_pending_age_seconds > 60` (Kafka delivery stuck) and
   `increase(ledger_outbox_publish_failures_total[5m]) > 0`.
+
+## Rate limiting
+
+Every `POST` under `/api/**` (create account, deposit, transfer) goes through a per-client token bucket
+stored in Redis. Reads are never limited.
+
+| Property | Default | Meaning |
+|---|---|---|
+| `ledger.rate-limit.enabled` | `true` | Turn the limiter on or off |
+| `ledger.rate-limit.capacity` | `50` | Burst size: requests a client can make at once |
+| `ledger.rate-limit.refill-per-second` | `20` | Sustained rate per client |
+| `ledger.rate-limit.client-id-header` | `X-Client-Id` | Header that identifies the client |
+
+- **Client identity**: the `X-Client-Id` header (`[A-Za-z0-9._:-]{1,64}`), otherwise the remote address.
+  The service has no authentication, so this header is trusted as-is. In production it would come from
+  the authenticated principal or API key at the gateway, otherwise a caller could rotate ids to bypass
+  the limit.
+- **Responses**: allowed requests carry `RateLimit-Limit` and `RateLimit-Remaining`. Rejected requests
+  get `429 Too Many Requests` as a problem detail with `"code": "RATE_LIMITED"` and a `Retry-After`
+  header in seconds.
+- **Atomicity**: refill, check and consume happen in one Lua script using Redis `TIME`, so concurrent
+  requests and multiple app instances share one consistent bucket without app clock skew. Buckets
+  expire once they would be full again, so idle clients cost no memory.
+- **Fail-open**: Redis calls time out after 200 ms. On any Redis error the request is allowed, a warning
+  is logged (at most every 30 s) and `ledger.ratelimit.decisions{result="unavailable"}` is incremented.
+  For a payment API, losing abuse protection briefly is better than rejecting legitimate payments.
+  For the same reason Redis is left out of `/actuator/health`.
+- **Retries count too**: an idempotent retry still consumes a token, since it still costs a request.
 
 ## Design notes
 
@@ -160,11 +192,10 @@ Notes:
 
 ## Roadmap
 
-- Redis-backed rate limiting per client
 - Multi-currency transfers with FX quotes
 - Consumer example (notification / fraud scoring service) reading `ledger.transfer-events`
 
 ## Tech stack
 
-Java 17 · Spring Boot 3.4 · Spring JDBC (`JdbcClient`) · PostgreSQL 16 · Flyway · Apache Kafka ·
+Java 17 · Spring Boot 3.4 · Spring JDBC (`JdbcClient`) · PostgreSQL 16 · Flyway · Apache Kafka · Redis ·
 Testcontainers · springdoc-openapi · Micrometer · Prometheus · Grafana · Docker Compose · GitHub Actions · k6
