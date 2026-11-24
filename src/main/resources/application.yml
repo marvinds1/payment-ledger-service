@@ -21,6 +21,12 @@ spring:
   jackson:
     serialization:
       write-dates-as-timestamps: false
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 200ms
+      connect-timeout: 200ms
 
 ledger:
   outbox:
@@ -29,6 +35,11 @@ ledger:
     poll-interval-ms: 500
     relay-enabled: true
     metrics-refresh-ms: 5000
+  rate-limit:
+    enabled: true
+    capacity: 50
+    refill-per-second: 20
+    client-id-header: X-Client-Id
 
 management:
   endpoints:
@@ -42,6 +53,9 @@ management:
       percentiles-histogram:
         ledger.transfer.duration: true
         http.server.requests: true
+  health:
+    redis:
+      enabled: false
 
 springdoc:
   swagger-ui:
