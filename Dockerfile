@@ -1,12 +1,13 @@
-FROM eclipse-temurin:17-jdk-alpine AS build
+FROM eclipse-temurin:17-jdk-jammy AS build
 WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends maven && rm -rf /var/lib/apt/lists/*
 COPY pom.xml .
 COPY src ./src
-RUN apk add --no-cache maven && mvn -q -B package -DskipTests
+RUN mvn -q -B package -DskipTests
 
-FROM eclipse-temurin:17-jre-alpine
+FROM eclipse-temurin:17-jre-jammy
 WORKDIR /app
-RUN addgroup -S app && adduser -S app -G app
+RUN useradd --system --uid 10001 app
 COPY --from=build /app/target/payment-ledger-service-*.jar app.jar
 USER app
 EXPOSE 8080
