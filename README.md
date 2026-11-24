@@ -19,6 +19,7 @@ published as an event.**
 | Reliable events | Transactional outbox: the event row is written in the same DB transaction as the transfer and relayed to Kafka by a poller using `FOR UPDATE SKIP LOCKED` (safe with multiple instances, at-least-once delivery). |
 | Auditability | Rejected transfers (e.g. insufficient funds) are persisted too, so a retry gets the same answer and there is a full trail. |
 | Schema | Versioned migrations with Flyway. Money is stored as `BIGINT` minor units, never floating point. |
+| Observability | Micrometer metrics exposed for Prometheus: transfer outcomes and latency, money moved, outbox backlog and publish failures. A provisioned Grafana dashboard ships with the repo. |
 
 ## Architecture
 
@@ -108,6 +109,42 @@ A [k6](https://k6.io) script lives in [`load-test/transfers.js`](load-test/trans
 docker run --rm -i --network host -e BASE_URL=http://localhost:8080 grafana/k6 run - < load-test/transfers.js
 ```
 
+## Observability
+
+Metrics are exposed at `/actuator/prometheus`. A local Prometheus + Grafana stack is included:
+
+```bash
+docker compose up -d postgres kafka
+docker compose --profile observability up -d   # Prometheus :9090, Grafana :3000
+mvn spring-boot:run
+```
+
+Open <http://localhost:3000>. The **Payment Ledger Service** dashboard is provisioned automatically
+(anonymous read-only access, local use only). Prometheus scrapes `host.docker.internal:8080`, so it
+works whether the app runs on the host or with `--profile app`.
+
+| Metric | Type | Tags | What it tells you |
+|---|---|---|---|
+| `ledger_transfers_total` | counter | `operation` (transfer, deposit), `outcome` (completed, rejected, replayed, failed), `reason` | Request mix; `reason` is a bounded business code such as `INSUFFICIENT_FUNDS` or `SAME_ACCOUNT` |
+| `ledger_transfer_duration_seconds` | histogram | `operation`, `outcome` | End-to-end service latency (p50/p95/p99 in the dashboard) |
+| `ledger_transfer_volume_total` | counter | `operation`, `currency` | Money moved by completed transfers, in minor units |
+| `ledger_outbox_pending_events` | gauge | – | Events written but not yet acknowledged by Kafka |
+| `ledger_outbox_oldest_pending_age_seconds` | gauge | – | How far event delivery is lagging behind; `0` when nothing is pending |
+| `ledger_outbox_published_events_total` | counter | – | Events relayed to Kafka |
+| `ledger_outbox_publish_failures_total` | counter | – | Failed relay batches (they are retried on the next poll) |
+
+Standard Spring Boot metrics (`http_server_requests_seconds`, HikariCP, JVM) are exported too.
+
+Notes:
+
+- The outbox gauges are refreshed by a background query every `ledger.outbox.metrics-refresh-ms`
+  (default 5 s), not on every scrape, so a scrape never adds load to the database. If the query
+  fails, the gauges report `NaN` rather than a stale value.
+- Tag values are bounded on purpose (no account ids, idempotency keys or free text) to keep
+  Prometheus cardinality low.
+- Suggested alerts: `ledger_outbox_oldest_pending_age_seconds > 60` (Kafka delivery stuck) and
+  `increase(ledger_outbox_publish_failures_total[5m]) > 0`.
+
 ## Design notes
 
 - **Why pessimistic locking instead of optimistic versioning?** Transfers on a hot account would
@@ -126,9 +163,8 @@ docker run --rm -i --network host -e BASE_URL=http://localhost:8080 grafana/k6 r
 - Redis-backed rate limiting per client
 - Multi-currency transfers with FX quotes
 - Consumer example (notification / fraud scoring service) reading `ledger.transfer-events`
-- Prometheus metrics and Grafana dashboard
 
 ## Tech stack
 
 Java 17 · Spring Boot 3.4 · Spring JDBC (`JdbcClient`) · PostgreSQL 16 · Flyway · Apache Kafka ·
-Testcontainers · springdoc-openapi · Docker Compose · GitHub Actions · k6
+Testcontainers · springdoc-openapi · Micrometer · Prometheus · Grafana · Docker Compose · GitHub Actions · k6

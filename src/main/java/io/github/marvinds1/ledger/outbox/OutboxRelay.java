@@ -1,5 +1,7 @@
 package io.github.marvinds1.ledger.outbox;
 
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -25,11 +27,20 @@ public class OutboxRelay {
     private final OutboxRepository outbox;
     private final KafkaTemplate<String, String> kafka;
     private final OutboxProperties properties;
+    private final Counter published;
+    private final Counter failures;
 
-    public OutboxRelay(OutboxRepository outbox, KafkaTemplate<String, String> kafka, OutboxProperties properties) {
+    public OutboxRelay(OutboxRepository outbox, KafkaTemplate<String, String> kafka, OutboxProperties properties,
+                       MeterRegistry registry) {
         this.outbox = outbox;
         this.kafka = kafka;
         this.properties = properties;
+        this.published = Counter.builder("ledger.outbox.published.events")
+                .description("Outbox events acknowledged by Kafka and marked as published")
+                .register(registry);
+        this.failures = Counter.builder("ledger.outbox.publish.failures")
+                .description("Outbox batches that failed to publish and will be retried")
+                .register(registry);
     }
 
     @Scheduled(fixedDelayString = "${ledger.outbox.poll-interval-ms:500}")
@@ -45,12 +56,15 @@ public class OutboxRelay {
         try {
             CompletableFuture.allOf(acks.toArray(CompletableFuture[]::new)).get(30, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
+            failures.increment();
             Thread.currentThread().interrupt();
             throw new IllegalStateException("Interrupted while publishing outbox batch", e);
         } catch (ExecutionException | TimeoutException e) {
+            failures.increment();
             throw new IllegalStateException("Failed to publish outbox batch starting at id " + events.get(0).id(), e);
         }
         outbox.markPublished(events.stream().map(OutboxEvent::id).toList());
+        published.increment(events.size());
         log.debug("Published {} outbox events", events.size());
     }
 

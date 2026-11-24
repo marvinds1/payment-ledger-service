@@ -28,12 +28,20 @@ ledger:
     batch-size: 100
     poll-interval-ms: 500
     relay-enabled: true
+    metrics-refresh-ms: 5000
 
 management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics
+        include: health,info,metrics,prometheus
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        ledger.transfer.duration: true
+        http.server.requests: true
 
 springdoc:
   swagger-ui:
