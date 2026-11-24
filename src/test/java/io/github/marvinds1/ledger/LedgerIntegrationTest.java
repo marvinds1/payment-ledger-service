@@ -4,6 +4,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -22,6 +24,7 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.actuate.observability.AutoConfigureObservability;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
@@ -36,7 +39,9 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.kafka.KafkaContainer;
 
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+        properties = "ledger.rate-limit.enabled=false")
+@AutoConfigureObservability
 @Testcontainers
 class LedgerIntegrationTest {
 
@@ -53,6 +58,9 @@ class LedgerIntegrationTest {
 
     @Autowired
     JdbcClient jdbc;
+
+    @Autowired
+    MeterRegistry meters;
 
     @Test
     void transferMovesMoneyAndWritesBalancedEntries() {
@@ -220,6 +228,54 @@ class LedgerIntegrationTest {
         }
     }
 
+    @Test
+    void transferOutcomesAreRecordedAsMetricsAndExposedToPrometheus() {
+        UUID alice = fundedAccount("Alice", 10_000);
+        UUID bob = fundedAccount("Bob", 0);
+        double completed = transferCount("completed", "none");
+        double replayed = transferCount("replayed", "none");
+        double rejected = transferCount("rejected", "INSUFFICIENT_FUNDS");
+        double failed = transferCount("failed", "SAME_ACCOUNT");
+        double volume = transferVolume();
+
+        String key = newKey();
+        transfer(key, alice, bob, 4_000);
+        transfer(key, alice, bob, 4_000);
+        transfer(newKey(), alice, bob, 50_000);
+        assertThat(transfer(newKey(), alice, alice, 1_000).getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+
+        assertThat(transferCount("completed", "none")).isEqualTo(completed + 1);
+        assertThat(transferCount("replayed", "none")).isEqualTo(replayed + 1);
+        assertThat(transferCount("rejected", "INSUFFICIENT_FUNDS")).isEqualTo(rejected + 1);
+        assertThat(transferCount("failed", "SAME_ACCOUNT")).isEqualTo(failed + 1);
+        assertThat(transferVolume()).isEqualTo(volume + 4_000);
+
+        ResponseEntity<String> scrape = rest.getForEntity("/actuator/prometheus", String.class);
+        assertThat(scrape.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(scrape.getBody()).contains(
+                "ledger_transfers_total{",
+                "ledger_transfer_duration_seconds_bucket{",
+                "ledger_transfer_volume_total{",
+                "ledger_outbox_pending_events{",
+                "ledger_outbox_oldest_pending_age_seconds{",
+                "ledger_outbox_published_events_total{",
+                "application=\"payment-ledger-service\"");
+    }
+
+    @Test
+    void outboxBacklogMetricsDrainToZeroOncePublished() {
+        UUID alice = fundedAccount("Alice", 1_000);
+        UUID bob = fundedAccount("Bob", 0);
+        double publishedBefore = meters.get("ledger.outbox.published.events").counter().count();
+        transfer(newKey(), alice, bob, 500);
+
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+            assertThat(meters.get("ledger.outbox.published.events").counter().count()).isGreaterThan(publishedBefore);
+            assertThat(meters.get("ledger.outbox.pending.events").gauge().value()).isZero();
+            assertThat(meters.get("ledger.outbox.oldest.pending.age").gauge().value()).isZero();
+        });
+    }
+
     private UUID fundedAccount(String owner, long initialBalance) {
         JsonNode account = rest.postForObject("/api/v1/accounts",
                 Map.of("ownerName", owner, "currency", "IDR"), JsonNode.class);
@@ -243,6 +299,20 @@ class LedgerIntegrationTest {
 
     private static Map<String, Object> body(UUID source, UUID target, long amount) {
         return Map.of("sourceAccountId", source, "targetAccountId", target, "amount", amount, "currency", "IDR");
+    }
+
+    private double transferCount(String outcome, String reason) {
+        Counter counter = meters.find("ledger.transfers")
+                .tags("operation", "transfer", "outcome", outcome, "reason", reason)
+                .counter();
+        return counter == null ? 0 : counter.count();
+    }
+
+    private double transferVolume() {
+        Counter counter = meters.find("ledger.transfer.volume")
+                .tags("operation", "transfer", "currency", "IDR")
+                .counter();
+        return counter == null ? 0 : counter.count();
     }
 
     private long balance(UUID accountId) {

@@ -14,31 +14,39 @@ public class TransferService {
     private final TransferExecutor executor;
     private final TransferRepository transfers;
     private final AccountRepository accounts;
+    private final TransferMetrics metrics;
 
-    TransferService(TransferExecutor executor, TransferRepository transfers, AccountRepository accounts) {
+    TransferService(TransferExecutor executor, TransferRepository transfers, AccountRepository accounts,
+                    TransferMetrics metrics) {
         this.executor = executor;
         this.transfers = transfers;
         this.accounts = accounts;
+        this.metrics = metrics;
     }
 
     public TransferResult transfer(String idempotencyKey, UUID source, UUID target, long amount, String currency,
                                    String reference) {
-        if (source.equals(target)) {
-            throw new BusinessRuleException("SAME_ACCOUNT", "Source and target accounts must differ");
-        }
-        return execute(new TransferCommand(idempotencyKey, source, target, amount, currency, reference, false));
+        return metrics.measure("transfer", () -> {
+            if (source.equals(target)) {
+                throw new BusinessRuleException("SAME_ACCOUNT", "Source and target accounts must differ");
+            }
+            return execute(new TransferCommand(idempotencyKey, source, target, amount, currency, reference, false));
+        });
     }
 
     public TransferResult deposit(UUID accountId, String idempotencyKey, long amount, String reference) {
-        Account account = accounts.findById(accountId)
-                .orElseThrow(() -> new NotFoundException("Account " + accountId + " not found"));
-        Account settlement = accounts.findSettlement(account.currency())
-                .orElseThrow(() -> new IllegalStateException("No settlement account for " + account.currency()));
-        if (account.canGoNegative()) {
-            throw new BusinessRuleException("SETTLEMENT_ACCOUNT_NOT_ALLOWED", "Cannot deposit into a settlement account");
-        }
-        return execute(new TransferCommand(idempotencyKey, settlement.id(), accountId, amount, account.currency(),
-                reference, true));
+        return metrics.measure("deposit", () -> {
+            Account account = accounts.findById(accountId)
+                    .orElseThrow(() -> new NotFoundException("Account " + accountId + " not found"));
+            Account settlement = accounts.findSettlement(account.currency())
+                    .orElseThrow(() -> new IllegalStateException("No settlement account for " + account.currency()));
+            if (account.canGoNegative()) {
+                throw new BusinessRuleException("SETTLEMENT_ACCOUNT_NOT_ALLOWED",
+                        "Cannot deposit into a settlement account");
+            }
+            return execute(new TransferCommand(idempotencyKey, settlement.id(), accountId, amount, account.currency(),
+                    reference, true));
+        });
     }
 
     public Transfer get(UUID id) {

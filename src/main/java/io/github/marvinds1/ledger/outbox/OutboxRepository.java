@@ -43,6 +43,17 @@ public class OutboxRepository {
                 .list();
     }
 
+    PendingStats pendingStats() {
+        return jdbc.sql("SELECT COUNT(*) AS pending, "
+                        + "COALESCE(EXTRACT(EPOCH FROM (now() - MIN(created_at))), 0) AS oldest_age_seconds "
+                        + "FROM outbox_events WHERE published_at IS NULL")
+                .query((rs, n) -> new PendingStats(rs.getLong("pending"), rs.getDouble("oldest_age_seconds")))
+                .single();
+    }
+
+    record PendingStats(long pending, double oldestAgeSeconds) {
+    }
+
     void markPublished(List<Long> ids) {
         jdbc.sql("UPDATE outbox_events SET published_at = now() WHERE id IN (:ids)")
                 .param("ids", ids)
